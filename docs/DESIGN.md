@@ -334,6 +334,300 @@ AI エージェントは PR に自らラベル（例: `agent:refactor`, `risk:lo
 
 ---
 
+## シーケンス図 (主要フロー)
+
+以下は §3（アーキテクチャ概要）・§6（GitHub 連携)・§8（AI エージェント連携)・§5（Web モード戦略）で述べた設計を、代表的な 4 つのフローに沿って時系列で示したものである。実装時の関数名・モジュール境界は「主要インターフェース仕様」（後述）と一致させる。
+
+**1. 初回起動シーケンス**: CLI 起動から設定ロード・GitHub からの初期データ取得・永続化・初期描画までの一連の流れ。
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as uvx stackdeck
+    participant Config as config.load_config()
+    participant Resolver as token_resolver
+    participant Client as GithubClient
+    participant Fetch as fetch_open_prs()
+    participant Mapper as map_raw_pr_to_domain()
+    participant DB as persist (SQLite)
+    participant App as StackDeckApp.compose()
+
+    User->>CLI: uvx stackdeck
+    CLI->>Config: load_config()
+    Config->>Resolver: resolve token (gh / env)
+    Resolver-->>Config: token
+    Config-->>CLI: StackDeckConfig
+    CLI->>Client: GithubClient(config)
+    CLI->>Fetch: fetch_open_prs(config, client)
+    Fetch->>Client: GraphQL query (author:@me)
+    Client-->>Fetch: RawPullRequest[]
+    Fetch-->>CLI: RawPullRequest[]
+    CLI->>Mapper: map_raw_pr_to_domain(raw) ×N
+    Mapper-->>CLI: PullRequest[]
+    CLI->>DB: persist(PullRequest[])
+    CLI->>App: StackDeckApp.compose()
+    App-->>User: PipelineBoard 描画
+```
+
+**2. Adaptive polling ループ**: フォーカス状態に応じた間隔でポーリングし、差分がある場合のみ永続化と再描画を行う。
+
+```mermaid
+sequenceDiagram
+    participant Scheduler as PollingScheduler
+    participant Fetch as fetch_open_prs()
+    participant Diff as compute_diff()
+    participant DB as persist
+    participant Board as PipelineBoard.refresh()
+
+    loop 常駐ループ
+        Scheduler->>Scheduler: next_interval() (フォーカス:30s / 非フォーカス:60s+)
+        Scheduler->>Scheduler: sleep(interval)
+        Scheduler->>Fetch: fetch_open_prs(config, client)
+        Fetch-->>Scheduler: RawPullRequest[]
+        Scheduler->>Diff: compute_diff(new, existing)
+        alt 変更あり
+            Diff->>DB: persist(変更分)
+            Diff->>Board: refresh(変更PRのみ)
+        else 変更なし
+            Diff-->>Scheduler: no-op（描画・書き込みなし）
+        end
+    end
+```
+
+**3. Checkout アクション**: ユーザー操作からローカルブランチ取得までのハッピーパスと、fetch/checkout それぞれの失敗時の分岐。
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Panel as PRDetailPanel
+    participant Action as checkout_pr()
+    participant Git as git CLI
+    participant Footer as FooterBar
+
+    User->>Panel: キー入力 "c"
+    Panel->>Action: checkout_pr(pr)
+    Action->>Git: git fetch origin <branch>
+    alt fetch 成功
+        Git-->>Action: OK
+        Action->>Git: git checkout <branch>
+        alt checkout 成功
+            Git-->>Action: OK
+            Action->>Footer: ステータス表示 "Checked out <branch>"
+        else checkout 失敗（作業ツリー未コミット変更等）
+            Git-->>Action: エラー
+            Action->>Footer: エラーメッセージ表示（処理を中断、ロールバックはしない）
+        end
+    else fetch 失敗（ネットワーク／権限）
+        Git-->>Action: エラー
+        Action->>Footer: エラーメッセージ表示（処理を中断）
+    end
+```
+
+**4. Web モード起動**: `textual-serve`（Path B、§5 参照）による同一マシン内ブラウザ配信の起動シーケンス。
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as uvx stackdeck web
+    participant Serve as serve.serve_web()
+    participant TS as textual-serve
+    participant Browser
+    participant Sub as StackDeckApp（サブプロセス）
+
+    User->>CLI: uvx stackdeck web
+    CLI->>Serve: serve_web(host="127.0.0.1", port=8765)
+    Serve->>TS: 起動、127.0.0.1:8765 で待受
+    Browser->>TS: HTTP接続 (http://localhost:8765)
+    TS->>Sub: 接続ごとにサブプロセスとして StackDeckApp 起動
+    Sub-->>TS: 描画フレーム
+    TS-->>Browser: WebSocket 経由でフレーム配信
+    Browser->>TS: キー入力／クリック（WebSocket）
+    TS->>Sub: 入力イベントを転送
+```
+
+---
+
+## モジュール依存図
+
+`src/stackdeck/` 配下の主要パッケージ間の import 方向を DAG として示す。矢印は「上流パッケージが下流パッケージを import する」向き。
+
+```mermaid
+graph LR
+    config["stackdeck.config"]
+    db["stackdeck.db"]
+    core["stackdeck.core"]
+    sync["stackdeck.sync"]
+    api["stackdeck.api"]
+    ui["stackdeck.ui"]
+    web["stackdeck.web"]
+
+    db --> config
+    core --> config
+    sync --> config
+    sync --> db
+    sync --> core
+    api --> config
+    api --> db
+    api --> core
+    ui --> api
+    web --> ui
+    web --> api
+```
+
+**ルール**: `config` / `db` / `core` は下流（`sync` / `api` / `ui` / `web`）を import してはならず、循環依存を作ってはならない。`core` は GitHub や SQLite の詳細を一切知らないドメイン層として維持し、`sync` が GitHub 側の生データを `core` のドメインモデルに変換して初めて `db` へ渡す。
+
+---
+
+## 主要インターフェース仕様
+
+以下は公開関数・クラスのシグネチャのみを抜粋したものであり、実装の詳細（内部ロジック・エラー処理の中身）はここには含めない。型は Python 3.11+ 構文を用いる。
+
+```python
+# stackdeck/config.py
+def load_config(path: str | None = None) -> StackDeckConfig:
+    """設定ファイルとトークン解決を行い StackDeckConfig を返す。"""
+
+
+# stackdeck/sync/github_client.py
+class GithubClient:
+    def __init__(self, token: str, base_url: str = "https://api.github.com") -> None:
+        """認証済みの GraphQL/REST クライアントを初期化する。"""
+
+    async def query(self, query: str, variables: dict[str, object]) -> dict[str, object]:
+        """GraphQL クエリを実行する。"""
+
+    async def rest(self, method: str, path: str, **kwargs: object) -> dict[str, object]:
+        """REST エンドポイントを呼び出す。"""
+
+
+# stackdeck/sync/fetch.py
+async def fetch_open_prs(config: StackDeckConfig, client: GithubClient) -> list[RawPullRequest]:
+    """設定済みリポジトリ群から Open PR の生データを取得する。"""
+
+
+# stackdeck/core/mapping.py
+def map_raw_pr_to_domain(raw: RawPullRequest) -> PullRequest:
+    """GitHub API の生データをドメインモデル PullRequest に変換する。"""
+
+def determine_status(pr: PullRequest) -> PRStatus:
+    """PR の状態からパイプライン上の列（PRStatus）を判定する。"""
+
+
+# stackdeck/core/stack_detection.py
+def build_stacks_from_base_chain(prs: list[PullRequest]) -> list[Stack]:
+    """base ブランチ連鎖と Depends-on オーバーライドから Stack の DAG を構築する。"""
+
+
+# stackdeck/core/depends_on.py
+def parse_depends_on(body: str) -> list[int]:
+    """PR 本文から `Depends-on: #123` 形式の PR 番号を抽出する。"""
+
+
+# stackdeck/sync/scheduler.py
+class PollingScheduler:
+    def next_interval(self) -> float:
+        """フォーカス状態に応じた次回ポーリング間隔（秒）を返す。"""
+
+
+# stackdeck/sync/diff.py
+def compute_diff(new: list[PullRequest], existing: list[PullRequest]) -> Diff:
+    """新旧の PR 一覧を比較し、変更差分（Diff）を算出する。"""
+
+
+# stackdeck/core/agent_resolution.py
+def resolve_agent(pr: PullRequest) -> Agent | None:
+    """ブランチプレフィックス／ラベルから PR の担当エージェントを解決する。"""
+
+
+# stackdeck/core/actions.py
+def checkout(pr: PullRequest) -> ActionResult:
+    """対象 PR のブランチをローカルに fetch + checkout する。"""
+
+def merge(pr: PullRequest, client: GithubClient) -> ActionResult:
+    """GitHub API 経由で PR を merge する。"""
+
+def deploy(pr: PullRequest, client: GithubClient) -> ActionResult:
+    """既存 CI/CD のデプロイトリガーを起動する。"""
+
+def edit_pr(pr: PullRequest, client: GithubClient, **changes: object) -> ActionResult:
+    """PR のタイトル／base ブランチ等を変更する。"""
+
+
+# stackdeck/api/routes.py
+@router.get("/stacks")
+async def get_stacks() -> list[Stack]:
+    """全スタックの一覧を返す。"""
+
+@router.get("/prs")
+async def get_prs(stack_id: str | None = None) -> list[PullRequest]:
+    """PR 一覧を返す（stack_id 指定でそのスタックに絞り込み）。"""
+
+@router.get("/prs/{pr_id}")
+async def get_pr_detail(pr_id: str) -> PullRequest:
+    """単一 PR の詳細を返す。"""
+
+@router.get("/agents")
+async def get_agents() -> list[Agent]:
+    """エージェント一覧を返す。"""
+
+
+# stackdeck/web/serve.py
+def serve_web(host: str = "127.0.0.1", port: int = 8765) -> None:
+    """textual-serve 経由で StackDeckApp をブラウザ配信する。"""
+```
+
+---
+
+## エラーハンドリング方針
+
+- 回復可能なエラー（単一 PR のデータ欠損・不整合、GraphQL の部分的エラーなど）は警告ログを出してその PR だけをスキップし、ボード全体の描画は継続する（1件の壊れたデータで全体を落とさない）。
+- 回復不可能なエラー（設定ファイル不備、トークン未設定・認証失敗）は起動時に即 fail-fast し、原因を明示した例外を送出して終了する（不完全な状態で起動を続けない）。
+- GitHub API のレート制限（429 / `x-ratelimit-remaining: 0`）は自動リトライしない。adaptive polling（本章「Adaptive polling ループ」参照）が次回間隔まで待つことで自然にバックオフする設計とし、リトライロジックの複雑さを持ち込まない。
+- Webhook 受信に関するエラーハンドリングは存在しない（§2 の非目的・§6 の方針により Webhook 自体を採用しないため、対応する例外系・リトライ系のコードは実装しない）。
+- ログレベル方針: `INFO` = 状態変化（起動・ポーリング結果反映・アクション成功など）、`WARNING` = 単一 PR のスキップ・部分的なデータ欠損、`ERROR` = fail-fast に至る前段の致命的な状況。
+
+---
+
+## テスト戦略
+
+- **ユニットテスト**: `tests/{config,db,sync,core,ui,api,web}/test_*.py` に配置し、`uv run pytest -q` のみで完結させる。外部ネットワーク通信は行わない。
+- **HTTP モック**: GitHub API（GraphQL/REST）は `respx` でモックし、Sync Worker・GithubClient のテストを決定的にする。
+- **Textual テスト**: `App.run_test()` で `StackDeckApp` を起動し、`pilot.press()` / `pilot.pause()` / `pilot.click()` でキー操作・クリックをシミュレートする。
+- **スナップショットテスト**: Textual 公式のスナップショットテスト（`pytest-textual-snapshot`）を Phase 1 以降で導入し、`PipelineBoard`/`PRDetailPanel` の視覚的リグレッションを検知する。
+- **統合テスト**: `tests/integration/` に、fetch → map → persist → UI 描画までを end-to-end で通すテストを置く。GitHub 呼び出しは `respx` モック、永続化層は in-memory SQLite を用い、外部依存なしで再現可能にする。
+- **手動確認が必要な項目**（実 GitHub トークンでの疎通確認、実ブラウザでの `textual-serve` 動作確認など、自動テストで代替できないもの）は `docs/MANUAL-TESTS.md` に別途列挙する運用とする。本ドキュメントの追記範囲ではファイルの新規作成は行わない。
+
+---
+
+## 決定ログ (ADR-lite)
+
+**ADR-001: Textual を採用する**
+- Context: TUI フレームワークの選定（比較対象は Ratatui / Bubble Tea / Ink）。
+- Decision: Python + Textual を採用する（次点: Go + Bubble Tea）。
+- Consequences: `textual-serve` により Web 配信コストが最小になる一方、シングルバイナリ配布はできない。詳細は「技術選定」参照。
+
+**ADR-002: Webhook を採用せず polling 一本化**
+- Context: 企業リポジトリでは Webhook 管理者権限がなく公開エンドポイントも立てられない。
+- Decision: Webhook を採用せず、adaptive polling interval（フォーカス時30秒/非フォーカス時60秒以上）のみで鮮度を担保する。
+- Consequences: 最大1分弱の反映遅延が生じる代わりに、統制上のリスク（Webhook 権限・公開エンドポイント）を回避できる。詳細は「GitHub 連携」参照。
+
+**ADR-003: 認証を Fine-grained PAT / `gh auth token` に限定**
+- Context: 会社統制下の GitHub では GitHub App のインストールが組織承認制で、共有サーバー運用も現実的でない。
+- Decision: 認証手段を Fine-grained PAT（Read-only スコープ主軸）と `gh auth token` の借用に限定する。
+- Consequences: 個人の権限のみで完結して動作するが、組織が PAT 発行自体を制限する場合は利用できないおそれがある。詳細は「GitHub 連携」および「リスクと未決事項」参照。
+
+**ADR-004: スタック検出は base 連鎖 + Depends-on オーバーライド**
+- Context: ghstack/spr/Graphite など複数のスタッキングワークフローに追加規約なしで対応したい。
+- Decision: base ブランチ連鎖を第一級の信号とし、PR本文の `Depends-on: #123` を優先度の高い明示的オーバーライドとして扱う。
+- Consequences: 大半のケースで規約追加なしに機能するが、両者の規約に従わない PR では帰属・依存が誤判定されうる。詳細は「GitHub 連携」「データモデル」参照。
+
+**ADR-005: v1 は observe-first（エージェントを起動しない）**
+- Context: エージェントの起動・制御には認可・冪等性・失敗時リトライなど別レイヤーの複雑さが伴う。
+- Decision: v1〜Phase 3 は GitHub 上の既存状態を観測するだけに留め、エージェント起動を伴うアクションは Phase 4 でオプトインとして慎重に追加する。
+- Consequences: v1 のスコープを小さく保てる一方、"Review Bot を再実行" 等の操作は当面提供されない。詳細は「AI エージェント連携」「ロードマップ」参照。
+
+---
+
 ## リスクと未決事項
 
 - **会社ポリシーによる Fine-grained PAT 発行制限**: 組織によっては Fine-grained PAT の発行自体を禁止・制限している、あるいは対象リポジトリの選択が組織承認制になっている可能性があり、その場合は `gh auth token` 経由の借用も含めて認証手段が使えなくなるおそれがある。
